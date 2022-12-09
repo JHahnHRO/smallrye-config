@@ -10,11 +10,11 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import java.util.List;
+import java.util.NoSuchElementException;
 import java.util.Optional;
 import java.util.Set;
 
 import javax.enterprise.context.Dependent;
-import javax.enterprise.inject.UnsatisfiedResolutionException;
 import javax.enterprise.inject.spi.CDI;
 import javax.inject.Inject;
 
@@ -37,8 +37,7 @@ import io.smallrye.config.SmallRyeConfigBuilder;
 @ExtendWith(WeldJunit5Extension.class)
 class ConfigPropertiesInjectionTest {
     @WeldSetup
-    WeldInitiator weld = WeldInitiator
-            .from(ConfigExtension.class, ConfigPropertiesInjectionTest.class, Server.class)
+    WeldInitiator weld = WeldInitiator.from(ConfigExtension.class, ConfigPropertiesInjectionTest.class, Server.class)
             .inject(this)
             .build();
 
@@ -91,6 +90,17 @@ class ConfigPropertiesInjectionTest {
         assertFalse(server.optionalList.isPresent());
         assertFalse(server.optionalSet.isPresent());
 
+        Server other = CDI.current().select(Server.class, ConfigProperties.Literal.of("other")).get();
+        assertNotNull(other);
+        assertEquals("localhost", other.theHost);
+        assertEquals(8443, other.port);
+        assertEquals(1, other.array.length);
+        assertEquals(1, other.list.size());
+        assertEquals(1, other.set.size());
+        assertFalse(other.optionalArray.isPresent());
+        assertFalse(other.optionalList.isPresent());
+        assertFalse(other.optionalSet.isPresent());
+
         Server cloud = CDI.current().select(Server.class, ConfigProperties.Literal.of("cloud")).get();
         assertNotNull(cloud);
         assertEquals("cloud", cloud.theHost);
@@ -112,7 +122,10 @@ class ConfigPropertiesInjectionTest {
         assertNull(config.getConfigValue("theHost").getValue());
         assertNull(config.getConfigValue("port").getValue());
 
-        assertThrows(UnsatisfiedResolutionException.class,
+        // The bean "@ConfigProperties Server" will be found, but its fields will be interpreted as having
+        // the qualifier @ConfigProperty(name=".host") etc. and that will fail with a NoSuchElementException during
+        // lookup.
+        assertThrows(NoSuchElementException.class,
                 () -> CDI.current().select(Server.class, ConfigProperties.Literal.of("")).get());
     }
 
@@ -121,6 +134,8 @@ class ConfigPropertiesInjectionTest {
     public static class Server {
         public String theHost;
         public int port;
+        @ConfigProperty(name = "useSSL")
+        public boolean useTLS;
         @ConfigProperty(defaultValue = "2")
         public Integer[] array;
         @ConfigProperty(defaultValue = "3")
@@ -134,11 +149,15 @@ class ConfigPropertiesInjectionTest {
 
     @BeforeAll
     static void beforeAll() {
-        SmallRyeConfig config = new SmallRyeConfigBuilder()
-                .withSources(config("server.theHost", "localhost", "server.port", "8080"))
-                .withSources(config("cloud.theHost", "cloud", "cloud.port", "9090", "cloud.array", "2,3",
-                        "cloud.list", "3,4", "cloud.set", "4,5", "cloud.optionalArray", "2,3",
-                        "cloud.optionalList", "3,4", "cloud.optionalSet", "4,5"))
+        SmallRyeConfig config = new SmallRyeConfigBuilder().withSources(
+                config("server.theHost", "localhost", "server.port", "8080", "server.useSSL", "false"))
+                .withSources(
+                        config("other.theHost", "localhost", "other.port", "8443", "other.useSSL",
+                                "true"))
+                .withSources(
+                        config("cloud.theHost", "cloud", "cloud.port", "9090", "could.useSSL", "true", "cloud.array",
+                                "2,3", "cloud.list", "3,4", "cloud.set", "4,5", "cloud.optionalArray", "2,3",
+                                "cloud.optionalList", "3,4", "cloud.optionalSet", "4,5"))
                 .addDefaultInterceptors()
                 .build();
         ConfigProviderResolver.instance().registerConfig(config, Thread.currentThread().getContextClassLoader());
