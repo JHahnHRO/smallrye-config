@@ -31,7 +31,6 @@ import javax.enterprise.inject.spi.Bean;
 import javax.enterprise.inject.spi.BeanManager;
 import javax.enterprise.inject.spi.InjectionPoint;
 import javax.enterprise.inject.spi.PassivationCapable;
-import javax.enterprise.util.AnnotationLiteral;
 import javax.inject.Provider;
 
 import org.eclipse.microprofile.config.Config;
@@ -160,15 +159,4 @@ public class ConfigInjectionBean<T> implements Bean<T>, PassivationCapable {
         return "ConfigInjectionBean_" + clazz;
     }
 
-    private static class ConfigPropertyLiteral extends AnnotationLiteral<ConfigProperty> implements ConfigProperty {
-        @Override
-        public String name() {
-            return "";
-        }
-
-        @Override
-        public String defaultValue() {
-            return "";
-        }
-    }
 }
