@@ -16,7 +16,6 @@
 package io.smallrye.config.inject;
 
 import static io.smallrye.config.ConfigMappings.registerConfigMappings;
-import static io.smallrye.config.ConfigMappings.registerConfigProperties;
 import static io.smallrye.config.ConfigMappings.ConfigClassWithPrefix.configClassWithPrefix;
 import static io.smallrye.config.inject.ConfigProducer.isClassHandledByConfigProducer;
 import static io.smallrye.config.inject.InjectionMessages.formatInjectionPoint;
@@ -25,6 +24,7 @@ import static java.util.stream.Collectors.toSet;
 
 import java.lang.reflect.ParameterizedType;
 import java.lang.reflect.Type;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -37,19 +37,25 @@ import java.util.function.Supplier;
 import java.util.stream.StreamSupport;
 
 import javax.enterprise.event.Observes;
+import javax.enterprise.inject.InjectionException;
 import javax.enterprise.inject.Instance;
+import javax.enterprise.inject.literal.InjectLiteral;
 import javax.enterprise.inject.spi.AfterBeanDiscovery;
 import javax.enterprise.inject.spi.AfterDeploymentValidation;
+import javax.enterprise.inject.spi.Annotated;
 import javax.enterprise.inject.spi.AnnotatedType;
 import javax.enterprise.inject.spi.BeanManager;
 import javax.enterprise.inject.spi.BeforeBeanDiscovery;
 import javax.enterprise.inject.spi.Extension;
 import javax.enterprise.inject.spi.InjectionPoint;
+import javax.enterprise.inject.spi.InjectionTarget;
 import javax.enterprise.inject.spi.ProcessAnnotatedType;
+import javax.enterprise.inject.spi.ProcessBean;
 import javax.enterprise.inject.spi.ProcessInjectionPoint;
+import javax.enterprise.inject.spi.ProcessInjectionTarget;
 import javax.enterprise.inject.spi.WithAnnotations;
-import javax.enterprise.inject.spi.configurator.AnnotatedTypeConfigurator;
-import javax.enterprise.util.Nonbinding;
+import javax.enterprise.inject.spi.configurator.AnnotatedFieldConfigurator;
+import javax.inject.Inject;
 import javax.inject.Provider;
 
 import org.eclipse.microprofile.config.ConfigProvider;
@@ -68,14 +74,23 @@ import io.smallrye.config.SmallRyeConfig;
  */
 public class ConfigExtension implements Extension {
     private final Set<InjectionPoint> configPropertyInjectionPoints = new HashSet<>();
-    /** ConfigProperties for SmallRye Config */
+    /**
+     * All @ConfigProperties annotations discovered during container initialization. Will be used during
+     * {@link AfterDeploymentValidation} phase to validate existence of the necessary properties.
+     */
     private final Set<ConfigClassWithPrefix> configProperties = new HashSet<>();
-    /** ConfigProperties for CDI */
-    private final Set<ConfigClassWithPrefix> configPropertiesBeans = new HashSet<>();
-    /** ConfigMappings for SmallRye Config */
+    /**
+     * ConfigMappings for SmallRye Config
+     */
     private final Set<ConfigClassWithPrefix> configMappings = new HashSet<>();
-    /** ConfigMappings for CDI */
+    /**
+     * ConfigMappings for CDI
+     */
     private final Set<ConfigClassWithPrefix> configMappingBeans = new HashSet<>();
+    /**
+     * Holds a {@link DynamicInjectionTarget} for each class annotated with {@link ConfigProperties}.
+     */
+    private final Map<Class<?>, DynamicInjectionTarget<?>> injectionTargetMap = new HashMap<>();
 
     public ConfigExtension() {
     }
@@ -84,33 +99,67 @@ public class ConfigExtension implements Extension {
         AnnotatedType<ConfigProducer> configBean = bm.createAnnotatedType(ConfigProducer.class);
         bbd.addAnnotatedType(configBean, ConfigProducer.class.getName());
 
-        // Remove NonBinding annotation. OWB is not able to look up CDI beans programmatically with NonBinding in the
-        // case the look-up changed the non-binding parameters (in this case the prefix)
-        AnnotatedTypeConfigurator<ConfigProperties> configPropertiesConfigurator = bbd
-                .configureQualifier(ConfigProperties.class);
-        configPropertiesConfigurator.methods().forEach(methodConfigurator -> methodConfigurator
-                .remove(annotation -> annotation.annotationType().equals(Nonbinding.class)));
+        /*
+         * The following may fix some behaviour with OWB, but causes another bug with programmatic lookup where
+         * prefixes that are not discoverable during container initialization will fail to resolve to the
+         *
+         * @ConfigProperties bean.
+         * See https://github.com/smallrye/smallrye-config/issues/860
+         *
+         * // Remove NonBinding annotation. OWB is not able to look up CDI beans programmatically with NonBinding in the
+         * // case the look-up changed the non-binding parameters (in this case the prefix)
+         * AnnotatedTypeConfigurator<ConfigProperties> configPropertiesConfigurator = bbd
+         * .configureQualifier(ConfigProperties.class);
+         * configPropertiesConfigurator.methods().forEach(methodConfigurator -> methodConfigurator
+         * .remove(annotation -> annotation.annotationType().equals(Nonbinding.class)));
+         *
+         */
     }
 
     protected void processConfigProperties(
             @Observes @WithAnnotations(ConfigProperties.class) ProcessAnnotatedType<?> processAnnotatedType) {
-        // Even if we filter in the CDI event, beans containing injection points of ConfigProperties are also fired.
-        if (processAnnotatedType.getAnnotatedType().isAnnotationPresent(ConfigProperties.class)) {
-            // We are going to veto, because it may be a managed bean, and we will use a configurator bean
-            processAnnotatedType.veto();
 
-            // Each config class is both in SmallRyeConfig and managed by a configurator bean.
-            // CDI requires more beans for injection points due to binding prefix.
-            ConfigClassWithPrefix properties = configClassWithPrefix(processAnnotatedType.getAnnotatedType().getJavaClass(),
-                    processAnnotatedType.getAnnotatedType().getAnnotation(ConfigProperties.class).prefix());
-            // Unconfigured is represented as an empty String in SmallRye Config
-            if (!properties.getPrefix().equals(ConfigProperties.UNCONFIGURED_PREFIX)) {
-                configProperties.add(properties);
-            } else {
-                configProperties.add(ConfigClassWithPrefix.configClassWithPrefix(properties.getKlass(), ""));
-            }
-            configPropertiesBeans.add(properties);
+        // Even if we filter in the CDI event, beans containing injection points of ConfigProperties are also fired.
+        final ConfigProperties configProperties = processAnnotatedType.getAnnotatedType()
+                .getAnnotation(ConfigProperties.class);
+        if (configProperties != null) {
+            processAnnotatedType.configureAnnotatedType()
+                    .fields()
+                    .forEach(f -> configureField(f, configProperties.prefix()));
         }
+    }
+
+    private <Y> void configureField(AnnotatedFieldConfigurator<Y> f, String prefix) {
+        if (!f.getAnnotated().isAnnotationPresent(Inject.class)) {
+            f.add(InjectLiteral.INSTANCE);
+        }
+
+        if (ConfigProperties.UNCONFIGURED_PREFIX.equals(prefix)) {
+            prefix = "";
+        } else {
+            prefix = prefix + ".";
+        }
+
+        final ConfigProperty configProperty = f.getAnnotated().getAnnotation(ConfigProperty.class);
+        final String name;
+        final String defaultValue;
+        if (configProperty == null) {
+            // if there is no qualifier, use the field name as key and no default value.
+            name = f.getAnnotated().getJavaMember().getName();
+            defaultValue = ConfigProperty.UNCONFIGURED_VALUE;
+        } else if (configProperty.name().isEmpty()) {
+            // if there is a qualifier for the default value, but it specifies no name, we use the field name instead.
+            name = f.getAnnotated().getJavaMember().getName();
+            defaultValue = configProperty.defaultValue();
+        } else {
+            // if there is already a qualifier, change its name, but keep the default value
+            name = configProperty.name();
+            defaultValue = configProperty.defaultValue();
+        }
+
+        // replace (possibly) existing qualifier with new qualifier whose name has the right prefix.
+        f.remove(q -> q.annotationType() == ConfigProperty.class)
+                .add(new ConfigPropertyLiteral(prefix + name, defaultValue));
     }
 
     protected void processConfigMappings(
@@ -122,7 +171,8 @@ public class ConfigExtension implements Extension {
 
             // Each config class is both in SmallRyeConfig and managed by a configurator bean.
             // CDI requires a single configurator bean per class due to non-binding prefix.
-            ConfigClassWithPrefix mapping = configClassWithPrefix(processAnnotatedType.getAnnotatedType().getJavaClass(),
+            ConfigClassWithPrefix mapping = configClassWithPrefix(
+                    processAnnotatedType.getAnnotatedType().getJavaClass(),
                     processAnnotatedType.getAnnotatedType().getAnnotation(ConfigMapping.class).prefix());
             configMappings.add(mapping);
             configMappingBeans.add(mapping);
@@ -142,8 +192,6 @@ public class ConfigExtension implements Extension {
             if (!properties.getPrefix().equals(ConfigProperties.UNCONFIGURED_PREFIX)) {
                 configProperties.add(properties);
             }
-            // Cover all combinations of the configurator bean for ConfigProperties because prefix is binding
-            configPropertiesBeans.add(properties);
         }
 
         // Add to SmallRyeConfig config classes with a different prefix by injection point
@@ -153,6 +201,30 @@ public class ConfigExtension implements Extension {
             // If the prefix is empty at the injection point, fallbacks to the class prefix (already registered)
             if (!mapping.getPrefix().isEmpty()) {
                 configMappings.add(mapping);
+            }
+        }
+    }
+
+    protected <T> void onProcessInjectionTarget(@Observes ProcessInjectionTarget<T> pit, BeanManager beanManager) {
+        AnnotatedType<T> annotatedType = pit.getAnnotatedType();
+        if (!annotatedType.isAnnotationPresent(ConfigProperties.class)) {
+            // bean not relevant
+            return;
+        }
+
+        DynamicInjectionTarget<T> injectionTarget = new DynamicInjectionTarget<>(beanManager, annotatedType,
+                pit.getInjectionTarget());
+        injectionTargetMap.put(annotatedType.getJavaClass(), injectionTarget);
+        pit.setInjectionTarget(injectionTarget);
+    }
+
+    protected <T> void onProcessBean(@Observes ProcessBean<T> pb) {
+        Annotated annotated = pb.getAnnotated();
+        if (annotated instanceof AnnotatedType) {
+            Class<T> cls = ((AnnotatedType<T>) annotated).getJavaClass();
+            DynamicInjectionTarget<T> dynamicInjectionTarget = (DynamicInjectionTarget<T>) injectionTargetMap.get(cls);
+            if (dynamicInjectionTarget != null) {
+                dynamicInjectionTarget.setBean(pb.getBean());
             }
         }
     }
@@ -178,19 +250,18 @@ public class ConfigExtension implements Extension {
         }
 
         customTypes.forEach(customType -> abd.addBean(new ConfigInjectionBean<>(bm, customType)));
-        configPropertiesBeans.forEach(properties -> abd.addBean(new ConfigPropertiesInjectionBean<>(properties)));
         configMappingBeans.forEach(mapping -> abd.addBean(new ConfigMappingInjectionBean<>(mapping, bm)));
     }
 
-    protected void validate(@Observes AfterDeploymentValidation adv) {
+    protected void validate(@Observes AfterDeploymentValidation adv, BeanManager beanManager) {
         SmallRyeConfig config = ConfigProvider.getConfig(getContextClassLoader()).unwrap(SmallRyeConfig.class);
         Set<String> configNames = StreamSupport.stream(config.getPropertyNames().spliterator(), false).collect(toSet());
         for (InjectionPoint injectionPoint : getConfigPropertyInjectionPoints()) {
             Type type = injectionPoint.getType();
 
             // We don't validate the Optional / Provider / Supplier / ConfigValue for defaultValue.
-            if (type instanceof Class && org.eclipse.microprofile.config.ConfigValue.class.isAssignableFrom((Class<?>) type)
-                    || type instanceof Class && OptionalInt.class.isAssignableFrom((Class<?>) type)
+            if (type instanceof Class && org.eclipse.microprofile.config.ConfigValue.class.isAssignableFrom(
+                    (Class<?>) type) || type instanceof Class && OptionalInt.class.isAssignableFrom((Class<?>) type)
                     || type instanceof Class && OptionalLong.class.isAssignableFrom((Class<?>) type)
                     || type instanceof Class && OptionalDouble.class.isAssignableFrom((Class<?>) type)
                     || type instanceof ParameterizedType
@@ -228,16 +299,40 @@ public class ConfigExtension implements Extension {
                 // Check if the value can be injected. This may cause duplicated config reads (to validate and to inject).
                 ConfigProducerUtil.getValue(injectionPoint, config);
             } catch (Exception e) {
-                adv.addDeploymentProblem(InjectionMessages.msg.retrieveConfigFailure(name, formatInjectionPoint(injectionPoint),
-                        e.getLocalizedMessage(), e));
+                adv.addDeploymentProblem(
+                        InjectionMessages.msg.retrieveConfigFailure(name, formatInjectionPoint(injectionPoint),
+                                e.getLocalizedMessage(), e));
             }
         }
 
         try {
             registerConfigMappings(config, configMappings);
-            registerConfigProperties(config, configProperties);
         } catch (ConfigValidationException e) {
             adv.addDeploymentProblem(e);
+        }
+
+        validateConfigProperties(adv, beanManager);
+    }
+
+    private void validateConfigProperties(AfterDeploymentValidation adv, BeanManager beanManager) {
+        for (ConfigClassWithPrefix classWithPrefix : configProperties) {
+            Class<?> beanClass = classWithPrefix.getKlass();
+            String prefix = classWithPrefix.getPrefix();
+
+            // not null, because this is called during AfterBeanValidation and therefore all injectionPoints that we
+            // used to fill the configProperties set were already validated.
+            DynamicInjectionTarget<?> dynamicInjectionTarget = injectionTargetMap.get(beanClass);
+            // has the side effect of creating all InjectionTarget instances that are needed for static
+            // injection points. Only programmatic injection can construct new instances now.
+            InjectionTarget<?> injectionTargetForPrefix = dynamicInjectionTarget.getInjectionTargetForPrefix(prefix);
+
+            for (InjectionPoint injectionPoint : injectionTargetForPrefix.getInjectionPoints()) {
+                try {
+                    beanManager.validate(injectionPoint);
+                } catch (InjectionException ex) {
+                    adv.addDeploymentProblem(ex);
+                }
+            }
         }
     }
 
@@ -259,7 +354,7 @@ public class ConfigExtension implements Extension {
      * @return {@code true} if the given type is a type of Map, {@code false} otherwise.
      */
     private static boolean isMap(final Type type) {
-        return type instanceof ParameterizedType &&
-                Map.class.isAssignableFrom((Class<?>) ((ParameterizedType) type).getRawType());
+        return type instanceof ParameterizedType && Map.class.isAssignableFrom(
+                (Class<?>) ((ParameterizedType) type).getRawType());
     }
 }
